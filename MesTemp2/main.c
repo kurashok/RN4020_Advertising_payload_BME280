@@ -97,7 +97,9 @@ void USART_SendStr(const char * str)
 
 #define RCV_SIZE 100
 char RCV_BUF[RCV_SIZE];
+char MSG_BUF[RCV_SIZE];
 uint8_t RCV_PTR = 0;
+volatile uint8_t bline_cmp = 0;
 
 void check_command()
 {
@@ -116,10 +118,11 @@ ISR (USART_RX_vect)
 	else if( value == '\x0a' )
 	{
 		RCV_BUF[RCV_PTR] = '\0';
-		check_command();
+		strcpy((char*)MSG_BUF,(const char*)RCV_BUF);
+		bline_cmp = RCV_PTR;
 		RCV_PTR = 0;
 	}
-	else
+	else if( isprint(value) )
 	{
 		RCV_BUF[RCV_PTR] = value;
 		if( RCV_PTR < RCV_SIZE-1 )
@@ -274,6 +277,104 @@ void send_advertise(char *buf)
 	PORTB &= ~1; // sleep mode
 }
 
+void exec_cmd(char *msg, char *buf)
+{
+	for(uint8_t i=0; msg[i]!='\0'; i++)
+	{
+		if( !isalpha(msg[i])) continue;
+		msg[i] = toupper(msg[i]);
+	}
+
+	if( strncmp(msg, "POW", 3) == 0 )
+	{
+		// TX POWER設定
+		uint8_t pow = atoi(msg+4);
+		write_eeprom( 7, (unsigned char)pow );
+		sprintf(buf, "ACK %d\x0d\x0a", pow);
+	}
+	else if(strncmp(msg,"RR", 2) == 0 )
+	{
+		// ROM読み込み
+		uint16_t adr = strtoul(msg+3, NULL, 16);
+		uint16_t dat = read_eeprom(adr);
+		sprintf(buf, "ACK %x\x0d\x0a", dat);
+	}
+	else if( strncmp(msg, "RW", 2) == 0 )
+	{
+		// ROM書き込み
+		uint16_t adr = strtoul(msg+3, NULL, 16);
+		uint16_t dat = strtoul(msg+6, NULL, 16);
+		write_eeprom( adr, (unsigned char)dat );
+		strcpy(buf, "ACK\x0d\x0a");
+	}
+	else
+	{
+		sprintf(buf, "ERR %s\x0d\x0a", msg);
+	}
+}
+
+void setting_mode()
+{
+	// アドバタイズ開始
+	USART_SendStr("a\x0d\x0a");
+	// 接続チェック
+	bool bConnect = false;
+	for(int i=0; i<30; i++)
+	{
+		PORTD |= (1 << 4);
+		_delay_ms(100);
+		PORTD &= ~(1 << 4);
+
+		_delay_ms(900);
+		if( PINB & 0x4 )
+		{
+			bConnect = true;
+			break;
+		}
+	}
+	// 接続なし
+	if( !bConnect )
+	{
+		// アドバイス停止
+		USART_SendStr("y\x0d\x0a");
+		return;
+	}
+	// 接続あり
+	PORTD |= (1 << 4);
+	_delay_ms(1000);
+	PORTD &= ~(1 << 4);
+	// MLPDモード設定
+	PORTB |= 2;
+	// コマンド受付・実行
+	sei();
+	bline_cmp = 0;
+	for(;;)
+	{
+		// コマンド受け取待ち
+		for(;;)
+		{
+			// 接続が切れたら終了
+			if( (PINB & 0x4) == 0 )
+			{
+				PORTB &= ~2; // cmd mode
+				PORTD &= ~(1 << 4); // led off
+				return;
+			}
+			// コマンド受け取ったらループ抜ける
+			if( bline_cmp != 0 )
+			{
+				bline_cmp = 0;
+				break;
+			}
+		}
+		// コマンド実行
+		char buf[100];
+		exec_cmd((char*)MSG_BUF, buf);
+		// 戻りを送信
+		USART_SendStr(buf);
+	}
+}
+
 void setup_RN4020()
 {
 	// B0 : output : WAKE_SW
@@ -297,6 +398,7 @@ void setup_RN4020()
 	send_RN4020_command("SS,00000007\x0d\x0a", NULL);
 	send_RN4020_command("SR,12000000\x0d\x0a", NULL);
 	send_RN4020_command("R,1\x0d\x0a", NULL);
+	_delay_ms(5000);
 
 	PORTD &= ~0x10; // led = 0
 }
@@ -542,6 +644,19 @@ void meas()
 	send_advertise(mes_buf);
 }
 
+void set_tx_power()
+{
+	uint8_t pow = read_eeprom(7);
+	if( pow == 0xff )
+	{
+		pow = 4;
+	}
+	if( pow > 8 ) pow = 7;
+	char buf[20];
+	sprintf(buf,"SP,%d\x0d\x0a", pow);
+	send_RN4020_command(buf, NULL);
+}
+
 int main(void)
 {
 	uint8_t cal = read_eeprom(0);
@@ -553,13 +668,17 @@ int main(void)
 	CLKPR = 0x03;// 分周比1/8 : クロックは1MHz
 
 	setup_USART();
-	disable_rxint();
 	DIDR0 = 0xf; // PC0,1,2,3はデジタル入力禁止。ADC入力専用
 	PRR |= (1<<PRTWI) | (1<<PRTIM0) | (1<<PRTIM1) | (1<<PRTIM2);
 
 	sei();			// 割込みを許可する。
 
 	setup_RN4020();
+	setting_mode();
+
+	disable_rxint();
+	
+	set_tx_power();
 	setup_iic();
 	setup_BME280();
 
